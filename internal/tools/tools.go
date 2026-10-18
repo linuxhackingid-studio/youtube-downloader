@@ -1,6 +1,6 @@
 // Package tools detects the external command-line tools required by the
 // downloader (yt-dlp and ffmpeg) and provides user-facing instructions
-// for installing them on Windows.
+// for installing them on Windows, Linux and macOS.
 package tools
 
 import (
@@ -8,7 +8,6 @@ import (
 	"context"
 	"errors"
 	"os/exec"
-	"strings"
 	"sync"
 	"time"
 )
@@ -21,7 +20,8 @@ const versionTimeout = 10 * time.Second
 type Status struct {
 	// Name is the tool's executable name: "yt-dlp" or "ffmpeg".
 	Name string
-	// Found reports whether the executable was located on PATH.
+	// Found reports whether the executable was located on PATH or in one
+	// of the well-known per-OS install directories.
 	Found bool
 	// Path is the resolved executable path; empty when the tool is missing.
 	Path string
@@ -65,27 +65,8 @@ func Check(ctx context.Context) Report {
 	return Report{YtDlp: ytdlp, FFmpeg: ffmpeg}
 }
 
-// InstallGuide returns a multi-line user-facing installation guide for
-// the missing tools. Callers render it verbatim.
-func InstallGuide() string {
-	return installGuide
-}
-
-const installGuide = `Missing required tools. Install them with Windows Package Manager (winget):
-
-  winget install yt-dlp.yt-dlp
-  winget install Gyan.FFmpeg
-
-FFmpeg note: "Gyan.FFmpeg" is the standard full build.
-The "yt-dlp.FFmpeg" package installs an FFmpeg build bundled for yt-dlp as an alternative:
-
-  winget install yt-dlp.FFmpeg
-
-After installing, restart this app (or press R to re-check).
-Verify manually:  yt-dlp --version     ffmpeg -version`
-
-// checkTool probes a single tool: it resolves the executable on PATH and
-// then runs its version command under a bounded timeout.
+// checkTool probes a single tool: it resolves the executable through
+// lookPath and then runs its version command under a bounded timeout.
 func checkTool(ctx context.Context, name, versionArg string, parse func(string) string) Status {
 	st := Status{Name: name}
 
@@ -94,9 +75,9 @@ func checkTool(ctx context.Context, name, versionArg string, parse func(string) 
 		return st
 	}
 
-	path, err := exec.LookPath(name)
+	path, err := lookPath(name)
 	if err != nil {
-		st.Err = name + " not found in PATH"
+		st.Err = name + " not found"
 		return st
 	}
 	st.Found = true
@@ -137,50 +118,4 @@ func failureReason(runCtx context.Context, err error, stderr string) string {
 		reason += ": " + last
 	}
 	return reason
-}
-
-// parseYtDlpVersion extracts the version from yt-dlp --version output.
-func parseYtDlpVersion(out string) string {
-	return firstLine(out)
-}
-
-// parseFFmpegVersion extracts the version token from the first line of
-// ffmpeg -version output. Real-world first lines look like:
-//
-//	ffmpeg version 9.0.2 Copyright (c) 2000-2026 the FFmpeg developers
-//	ffmpeg version N-126374-g089a48eb36-20260831 Copyright (c) 2000-2026 the FFmpeg developers
-//
-// which yield "9.0.2" and "N-126374-g089a48eb36-20260831" respectively.
-// Inputs that carry the "version" keyword without a value (e.g. simply
-// "ffmpeg version") return "".
-func parseFFmpegVersion(out string) string {
-	fields := strings.Fields(firstLine(out))
-	if len(fields) >= 2 && strings.EqualFold(fields[1], "version") {
-		if len(fields) >= 3 {
-			return fields[2]
-		}
-		return ""
-	}
-	if len(fields) >= 2 {
-		return fields[1]
-	}
-	return ""
-}
-
-// firstLine returns the first line of s with surrounding whitespace,
-// including a trailing carriage return, removed.
-func firstLine(s string) string {
-	line, _, _ := strings.Cut(s, "\n")
-	return strings.TrimSpace(line)
-}
-
-// lastNonEmptyLine returns the last non-blank line of s, trimmed.
-func lastNonEmptyLine(s string) string {
-	lines := strings.Split(s, "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		if line := strings.TrimSpace(lines[i]); line != "" {
-			return line
-		}
-	}
-	return ""
 }
