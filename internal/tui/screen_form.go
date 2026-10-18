@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"strconv"
 	"strings"
 
 	"charm.land/bubbles/v2/textinput"
@@ -16,83 +15,21 @@ import (
 // parent screen then persists the configuration and fetches the playlist.
 type formSubmitMsg struct{}
 
-// Form field positions, in focus order.
-const (
-	formFieldURL = iota
-	formFieldTargetDir
-	formFieldQuality
-	formFieldCookies
-	formFieldConcurrency
-	formFieldRangeStart
-	formFieldRangeEnd
-	formFieldTemplate
-	formFieldCount
-)
-
-// Textinput slots, ordered like the fields they serve. The two selector
-// fields (quality and cookies) have no textinput slot.
-const (
-	formSlotURL = iota
-	formSlotTargetDir
-	formSlotConcurrency
-	formSlotRangeStart
-	formSlotRangeEnd
-	formSlotTemplate
-	formTextInputCount
-)
-
-// formInputFields maps every textinput slot to the form field it serves.
-var formInputFields = [formTextInputCount]int{
-	formFieldURL,
-	formFieldTargetDir,
-	formFieldConcurrency,
-	formFieldRangeStart,
-	formFieldRangeEnd,
-	formFieldTemplate,
-}
-
-// formFieldLabels holds the label rendered above each field, in focus order.
-var formFieldLabels = [formFieldCount]string{
-	"Playlist URL",
-	"Target folder",
-	"Quality",
-	"Cookies from browser",
-	"Concurrent downloads",
-	"Range start (blank = all)",
-	"Range end (blank = all)",
-	"Filename template",
-}
-
-// cookieBrowserOptions lists the selectable cookie sources in cycle order.
-// Index 0 ("none") is stored as an empty string.
-var cookieBrowserOptions = [...]string{
-	"none", "chrome", "chromium", "edge", "firefox",
-	"brave", "opera", "vivaldi", "whale", "safari",
-}
-
-// Concurrency bounds applied by Config.
-const (
-	formDefaultConcurrency = 3
-	formMinConcurrency     = 1
-	formMaxConcurrency     = 10
-)
-
-// formHelpMinWidth is the smallest viewport that still leaves room for the
-// help legend.
-const formHelpMinWidth = 60
-
-// formFocusStyle emphasizes the label of the field that owns keyboard focus.
-var formFocusStyle = lg.NewStyle().Bold(true)
+// formCompactMinHeight is the body height below which the form switches to
+// its one-line-per-field layout, so the last fields stay reachable in a short
+// terminal instead of being scrolled off the bottom.
+const formCompactMinHeight = 26
 
 // formModel is the download-configuration form screen. The zero value is not
 // usable; construct it with newFormModel.
 type formModel struct {
-	inputs  [formTextInputCount]textinput.Model
-	focus   int
-	quality ytdlp.Quality
-	cookies string // "" = none
-	err     string
-	width   int
+	inputs    [formTextInputCount]textinput.Model
+	focus     int
+	quality   ytdlp.Quality
+	cookies   string // "" = none
+	err       string // screen-level banner (config validation or fetch errors)
+	fieldErrs [formFieldCount]string
+	width     int
 }
 
 // newFormModel builds the form, prefilled from cfg. The first field starts
@@ -132,87 +69,100 @@ func newFormModel(cfg config.Config) formModel {
 	return m
 }
 
-// Init focuses the first input and returns its cursor-blink command.
+// Init returns the focus command of the constructor-focused first field.
+//
+// It must not try to move focus itself: the app calls m.form.Init() for its
+// command and discards the returned model, so a focus assignment here would
+// silently target a copy that is thrown away. newFormModel focuses the first
+// field once, at construction, and focus then persists across visits to the
+// screen - which is the intended behavior: re-entering the form puts the user
+// back on the field they were editing.
 func (m formModel) Init() tea.Cmd {
-	m.focus = formFieldURL
 	return m.focusCmd()
 }
 
 // Update routes keyboard input: tab/up/down move focus, left/right cycle the
 // focused selector, enter advances focus or submits from the last field, and
-// everything else reaches the focused textinput.
+// everything else reaches the focused textinput. Submitting runs the
+// field-level checks first: on failure focus jumps to the first field that
+// needs attention and no formSubmitMsg is emitted.
 func (m formModel) Update(msg tea.Msg) (formModel, tea.Cmd) {
-	if keyMsg, ok := msg.(tea.KeyPressMsg); ok {
-		switch keyMsg.String() {
-		case "tab", "down":
-			return m.moveFocus(1)
-		case "shift+tab", "up":
-			return m.moveFocus(-1)
-		case "left":
-			switch m.focus {
-			case formFieldQuality:
-				m.cycleQuality(-1)
-				return m, nil
-			case formFieldCookies:
-				m.cycleCookies(-1)
-				return m, nil
-			}
-		case "right":
-			switch m.focus {
-			case formFieldQuality:
-				m.cycleQuality(1)
-				return m, nil
-			case formFieldCookies:
-				m.cycleCookies(1)
-				return m, nil
-			}
-		case "enter":
-			if m.focus == formFieldTemplate {
-				return m, func() tea.Msg { return formSubmitMsg{} }
-			}
-			return m.moveFocus(1)
+	keyMsg, ok := msg.(tea.KeyPressMsg)
+	if !ok {
+		return m.forwardToInput(msg)
+	}
+	switch keyMsg.String() {
+	case "tab", "down":
+		return m.moveFocus(1)
+	case "shift+tab", "up":
+		return m.moveFocus(-1)
+	case "left":
+		switch m.focus {
+		case formFieldQuality:
+			m.cycleQuality(-1)
+			return m, nil
+		case formFieldCookies:
+			m.cycleCookies(-1)
+			return m, nil
 		}
+	case "right":
+		switch m.focus {
+		case formFieldQuality:
+			m.cycleQuality(1)
+			return m, nil
+		case formFieldCookies:
+			m.cycleCookies(1)
+			return m, nil
+		}
+	case "enter":
+		if m.focus == formFieldTemplate {
+			m = m.validateFields()
+			if first := m.firstFieldErr(); first >= 0 {
+				return m.moveFocusTo(first)
+			}
+			return m, func() tea.Msg { return formSubmitMsg{} }
+		}
+		return m.moveFocus(1)
 	}
 	return m.forwardToInput(msg)
 }
 
-// View renders the form for the given viewport size.
+// View renders the form for the given viewport size. A short viewport
+// switches to the compact one-line-per-field layout.
 func (m formModel) View(width, height int) string {
 	m.width = width
 
-	inputWidth := width - 4
-	if inputWidth < 30 {
-		inputWidth = 30
-	}
-	if inputWidth > 80 {
-		inputWidth = 80
-	}
+	inputWidth := min(max(width-4, 30), 80)
 	for slot := range m.inputs {
 		m.inputs[slot].SetWidth(inputWidth)
 	}
 
+	compact := height > 0 && height < formCompactMinHeight
+
 	var b strings.Builder
 	b.WriteString(StyleTitle.Render("Download configuration"))
-	b.WriteString("\n\n")
+	b.WriteString("\n")
 
 	if m.err != "" {
-		b.WriteString(StyleError.Render(m.err))
-		b.WriteString("\n\n")
+		b.WriteString("\n")
+		b.WriteString(StyleError.Render("  ! " + Sanitize(m.err)))
+		b.WriteString("\n")
+	} else {
+		b.WriteString("\n")
 	}
 
 	for field := 0; field < formFieldCount; field++ {
-		b.WriteString(m.renderField(field))
+		if heading := formSectionFor(field); heading != "" {
+			b.WriteString(StyleHeading.Render(heading))
+			b.WriteString("\n")
+		}
+		if compact {
+			b.WriteString(m.renderFieldCompact(field))
+		} else {
+			b.WriteString(m.renderField(field))
+		}
 	}
 
-	if width >= formHelpMinWidth {
-		b.WriteString("\n")
-		b.WriteString(RenderHelp(
-			[2]string{"tab/up/down", "move"},
-			[2]string{"←/→", "change selector"},
-			[2]string{"enter", "fetch playlist (on last field)"},
-			[2]string{"esc", "back"},
-		))
-	}
 	return b.String()
 }
 
@@ -241,62 +191,123 @@ func (m formModel) Config() config.Config {
 func (m formModel) SetError(msg string) formModel {
 	msg = Sanitize(msg)
 	m.err = msg
+	m.fieldErrs = [formFieldCount]string{}
 	return m
 }
 
-// moveFocus shifts keyboard focus by delta, clamped to the field range, and
-// returns the focus command of the newly focused textinput (nil for
-// selectors).
-func (m formModel) moveFocus(delta int) (formModel, tea.Cmd) {
-	next := m.focus + delta
-	if next < 0 {
-		next = 0
+// validateFields runs the cheap, field-local checks that do not need a
+// network or a filesystem, so the user gets the message next to the field
+// that caused it. Screen-level problems (an invalid URL scheme, a bad
+// filename template) are still reported by config.Validate through SetError.
+func (m formModel) validateFields() formModel {
+	m.fieldErrs = [formFieldCount]string{}
+
+	if strings.TrimSpace(m.inputs[formSlotURL].Value()) == "" {
+		m.fieldErrs[formFieldURL] = "required: paste the playlist or video URL"
 	}
-	if next >= formFieldCount {
-		next = formFieldCount - 1
+	if strings.TrimSpace(m.inputs[formSlotTargetDir].Value()) == "" {
+		m.fieldErrs[formFieldTargetDir] = "required: downloads need a folder"
 	}
-	if next == m.focus {
-		return m, nil
+	if v := strings.TrimSpace(m.inputs[formSlotConcurrency].Value()); v == "" {
+		m.fieldErrs[formFieldConcurrency] = "blank means 3; type a number 1-10 to pin it"
 	}
-	m.blurFocused()
-	m.focus = next
-	return m, m.focusCmd()
+	start := parseRange(m.inputs[formSlotRangeStart].Value())
+	end := parseRange(m.inputs[formSlotRangeEnd].Value())
+	if start > 0 && end > 0 && start > end {
+		m.fieldErrs[formFieldRangeStart] = "range start must not be after the range end"
+		m.fieldErrs[formFieldRangeEnd] = "range end must not be before the range start"
+	}
+	return m
 }
 
-// forwardToInput hands msg to the focused textinput; selectors consume their
-// own keys, so messages received while they are focused are dropped.
-func (m formModel) forwardToInput(msg tea.Msg) (formModel, tea.Cmd) {
-	slot := inputSlot(m.focus)
-	if slot < 0 {
-		return m, nil
+// firstFieldErr returns the focus order position of the first field with a
+// validation message, or -1 when every field is clean.
+func (m formModel) firstFieldErr() int {
+	for field := 0; field < formFieldCount; field++ {
+		if m.fieldErrs[field] != "" {
+			return field
+		}
 	}
-	var cmd tea.Cmd
-	m.inputs[slot], cmd = m.inputs[slot].Update(msg)
-	return m, cmd
+	return -1
 }
 
-// renderField renders one label line and one value line. The focused field is
-// prefixed with "▶" and shown plainly; the others are muted.
+// renderField renders one field as a label line and a value line. The focused
+// field is marked with "▶" and its label carries the key style; the others
+// are muted. A field-level validation message is rendered underneath in the
+// error style.
 func (m formModel) renderField(field int) string {
 	label := formFieldLabels[field]
 	value := m.renderValue(field)
 
+	var b strings.Builder
 	if m.focus == field {
-		var b strings.Builder
-		b.WriteString(formFocusStyle.Render("▶ " + label))
+		b.WriteString(StyleAccent.Render("▶ "))
+		b.WriteString(StyleKey.Render(label))
 		b.WriteString("\n  ")
 		b.WriteString(value)
 		b.WriteString("\n")
-		return b.String()
+	} else {
+		b.WriteString(StyleMuted.Render("  " + label))
+		b.WriteString("\n  ")
+		b.WriteString(value)
+		b.WriteString("\n")
 	}
-	return StyleMuted.Render("  "+label+"\n  "+value) + "\n"
+	b.WriteString(m.renderFieldErr(field))
+	return b.String()
+}
+
+// renderFieldCompact renders one field on a single line for short terminals:
+// "▶ label   value". The label is truncated to a third of the width and the
+// value is fitted to the columns that are left, so the row ends inside the
+// terminal instead of being clipped over the input's blank padding.
+func (m formModel) renderFieldCompact(field int) string {
+	label := Truncate(formFieldLabels[field], max(m.width/3, 12))
+
+	var prefix string
+	if m.focus == field {
+		prefix = StyleAccent.Render("▶ ") + StyleKey.Render(label) + "  "
+	} else {
+		prefix = StyleMuted.Render("  " + label + "  ")
+	}
+	m = m.fitFieldInput(field, m.width-lg.Width(prefix))
+
+	var b strings.Builder
+	b.WriteString(prefix)
+	b.WriteString(m.renderValue(field))
+	b.WriteString("\n")
+	b.WriteString(m.renderFieldErr(field))
+	return b.String()
+}
+
+// fitFieldInput narrows the textinput of field to avail columns so a compact
+// row stays inside the terminal width. Selectors have no input and are left
+// alone; both the layout and the value come from the returned copy, because
+// the receiver is a per-frame copy of the form.
+//
+// bubbles renders one column more than the width it is given (the cell the
+// cursor occupies), so the field is sized one short: clipping that trailing
+// cell would draw a stray ellipsis after the input's blank padding.
+func (m formModel) fitFieldInput(field, avail int) formModel {
+	if slot := inputSlot(field); slot >= 0 {
+		m.inputs[slot].SetWidth(max(avail-1, 12))
+	}
+	return m
+}
+
+// renderFieldErr renders the field's validation message, or nothing when the
+// field is clean.
+func (m formModel) renderFieldErr(field int) string {
+	if m.fieldErrs[field] == "" {
+		return ""
+	}
+	return StyleError.Render("  ! "+m.fieldErrs[field]) + "\n"
 }
 
 // renderValue renders the current value of a field; selectors gain "< >"
 // arrows while focused.
 func (m formModel) renderValue(field int) string {
 	if slot := inputSlot(field); slot >= 0 {
-		return m.inputs[slot].View()
+		return styledInput(m.inputs[slot]).View()
 	}
 	var label string
 	switch field {
@@ -306,9 +317,42 @@ func (m formModel) renderValue(field int) string {
 		label = cookieBrowserOptions[cookiesIndex(m.cookies)]
 	}
 	if m.focus == field {
-		return "< " + label + " >"
+		return StyleValue.Render("< ") + label + StyleValue.Render(" >")
 	}
-	return label
+	return StyleValue.Render(label)
+}
+
+// moveFocus shifts keyboard focus by delta, clamped to the field range.
+func (m formModel) moveFocus(delta int) (formModel, tea.Cmd) {
+	return m.moveFocusTo(min(max(m.focus+delta, 0), formFieldCount-1))
+}
+
+// moveFocusTo focuses field and returns the focus command of the newly
+// focused textinput (nil for selectors).
+func (m formModel) moveFocusTo(field int) (formModel, tea.Cmd) {
+	if field < 0 || field >= formFieldCount || field == m.focus {
+		return m, nil
+	}
+	m.blurFocused()
+	m.focus = field
+	return m, m.focusCmd()
+}
+
+// forwardToInput hands msg to the focused textinput; selectors consume their
+// own keys, so messages received while they are focused are dropped. Editing
+// a field clears its validation message, because the message is about the
+// value the user is replacing.
+func (m formModel) forwardToInput(msg tea.Msg) (formModel, tea.Cmd) {
+	slot := inputSlot(m.focus)
+	if slot < 0 {
+		return m, nil
+	}
+	if _, ok := msg.(tea.KeyPressMsg); ok {
+		m.fieldErrs[m.focus] = ""
+	}
+	var cmd tea.Cmd
+	m.inputs[slot], cmd = m.inputs[slot].Update(msg)
+	return m, cmd
 }
 
 // blurFocused blurs the current field when it is a textinput.
@@ -350,95 +394,4 @@ func (m *formModel) cycleCookies(delta int) {
 		return
 	}
 	m.cookies = cookieBrowserOptions[idx]
-}
-
-// inputSlot returns the textinput slot serving field, or -1 when the field is
-// a selector.
-func inputSlot(field int) int {
-	for slot, f := range formInputFields {
-		if f == field {
-			return slot
-		}
-	}
-	return -1
-}
-
-// validateDigits accepts empty input or ASCII digits only.
-func validateDigits(value string) error {
-	for _, r := range value {
-		if r < '0' || r > '9' {
-			// Reuse strconv's sentinel so the file needs no extra import.
-			return strconv.ErrSyntax
-		}
-	}
-	return nil
-}
-
-// normalizeQuality maps unknown values to QBest.
-func normalizeQuality(q ytdlp.Quality) ytdlp.Quality {
-	for _, known := range ytdlp.AllQualities() {
-		if q == known {
-			return q
-		}
-	}
-	return ytdlp.QBest
-}
-
-// normalizeCookies maps unknown browser names to "" (none).
-func normalizeCookies(browser string) string {
-	if browser == "" {
-		return ""
-	}
-	for _, option := range cookieBrowserOptions {
-		if option == browser {
-			return browser
-		}
-	}
-	return ""
-}
-
-// cookiesIndex maps a stored cookie source to its position in
-// cookieBrowserOptions; "" (none) and unknown values map to 0.
-func cookiesIndex(value string) int {
-	if value == "" {
-		return 0
-	}
-	for i, option := range cookieBrowserOptions {
-		if option == value {
-			return i
-		}
-	}
-	return 0
-}
-
-// parseConcurrency converts the concurrency field to 1..10, falling back to
-// the default for blank or invalid input.
-func parseConcurrency(value string) int {
-	n, err := strconv.Atoi(strings.TrimSpace(value))
-	if err != nil || n < formMinConcurrency {
-		return formDefaultConcurrency
-	}
-	if n > formMaxConcurrency {
-		return formMaxConcurrency
-	}
-	return n
-}
-
-// parseRange converts a range bound to a playlist index; blank or invalid
-// input means "unset" (0).
-func parseRange(value string) int {
-	n, err := strconv.Atoi(strings.TrimSpace(value))
-	if err != nil || n < 0 {
-		return 0
-	}
-	return n
-}
-
-// positiveNumber renders n for prefill, or "" when n is unset so that the
-// placeholder shows through.
-func positiveNumber(n int) string {
-	if n <= 0 {
-		return ""
-	}
-	return strconv.Itoa(n)
 }

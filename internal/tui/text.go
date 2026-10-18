@@ -1,83 +1,60 @@
 package tui
 
 import (
-	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 
 	lg "charm.land/lipgloss/v2"
 )
 
-// RenderHelp renders a muted single-line key legend such as
-// "enter: start  •  space: toggle". Each pair is {key, description}.
-func RenderHelp(pairs ...[2]string) string {
-	parts := make([]string, 0, len(pairs))
-	for _, p := range pairs {
-		parts = append(parts, p[0]+": "+p[1])
+// runeWidthCacheMax bounds the rune-width table: every rune below it gets a
+// cached answer, larger runes go through runeWidthWide. 1<<16 covers Latin,
+// Greek, Cyrillic, CJK and the Hangul syllables with room to spare, which is
+// exactly where the per-rune measurement shows up.
+const runeWidthCacheMax = 1 << 16
+
+// runeWidthTable memoizes the display width of one rune: an entry stores
+// width+1, so 0 means "not measured yet" and a genuinely zero-width rune (a
+// combining mark) is cached as 1 instead of looking unmeasured forever. The
+// entries are atomic so the table is race-free even if callers render in
+// parallel - the TUI itself renders on a single goroutine, and a duplicate
+// measurement merely stores the same value twice.
+var runeWidthTable [runeWidthCacheMax]atomic.Uint32
+
+// runeWidthWide memoizes the width of the runes at or above runeWidthCacheMax:
+// emoji, less common CJK extensions and other astral-plane codepoints. They are
+// far too sparse for the dense table, but measuring one allocates (lg.Width
+// converts the rune to a string), and a title that repeats the same emoji on
+// every row would pay that allocation on every frame. The key's presence marks
+// a rune as measured, so a genuine zero width caches as itself here. Like the
+// table, the map is safe for concurrent callers: a duplicate load-and-store
+// only recomputes the same width.
+var runeWidthWide sync.Map // rune -> int
+
+// runeWidth returns the number of terminal columns r occupies. ASCII is
+// always one column, which keeps the hot path free of both a table lookup and
+// the heap allocation lg.Width(string(r)) would make. Control runes are the
+// callers' concern: Sanitize strips them before any width is measured.
+func runeWidth(r rune) int {
+	if r < 0x80 {
+		return 1
 	}
-	return StyleMuted.Render(strings.Join(parts, "  •  "))
-}
-
-// RenderBox draws body inside a rounded border with title embedded in the
-// top edge. width is the total rendered width and is clamped to a minimum
-// of 20 columns; every body line is truncated to fit and space-padded so
-// the right border stays straight.
-func RenderBox(title, body string, width int) string {
-	if width < 20 {
-		width = 20
-	}
-
-	border := lg.RoundedBorder()
-	inner := width - 2 // columns between the vertical borders
-
-	// Top edge: "╭─ title ────╮".
-	label := title
-	if maxLabel := inner - 3; lg.Width(label) > maxLabel {
-		label = Truncate(label, maxLabel)
-	}
-	fill := max(inner-3-lg.Width(label), 0)
-
-	var out strings.Builder
-	out.Grow(width * (strings.Count(body, "\n") + 3))
-	out.WriteString(border.TopLeft)
-	out.WriteString(border.Top)
-	out.WriteByte(' ')
-	out.WriteString(label)
-	out.WriteByte(' ')
-	out.WriteString(strings.Repeat(border.Top, fill))
-	out.WriteString(border.TopRight)
-
-	// Body: "│ line │" for every line, padded to the interior width.
-	textW := inner - 2
-	for _, raw := range strings.Split(body, "\n") {
-		line := raw
-		if lg.Width(line) > textW {
-			line = Truncate(line, textW)
+	if r < runeWidthCacheMax {
+		if w := runeWidthTable[r].Load(); w != 0 {
+			return int(w) - 1
 		}
-		out.WriteByte('\n')
-		out.WriteString(border.Left)
-		out.WriteByte(' ')
-		out.WriteString(line)
-		out.WriteString(strings.Repeat(" ", max(textW-lg.Width(line), 0)))
-		out.WriteByte(' ')
-		out.WriteString(border.Right)
+		w := lg.Width(string(r))
+		runeWidthTable[r].Store(uint32(w) + 1)
+		return w
 	}
-
-	out.WriteByte('\n')
-	out.WriteString(border.BottomLeft)
-	out.WriteString(strings.Repeat(border.Bottom, inner))
-	out.WriteString(border.BottomRight)
-
-	return out.String()
-}
-
-// Checkbox renders an ASCII checkbox marker: "[x]" when checked, "[ ]"
-// otherwise. ASCII is a deliberate choice for maximum terminal support.
-func Checkbox(checked bool) string {
-	if checked {
-		return "[x]"
+	if w, ok := runeWidthWide.Load(r); ok {
+		return w.(int)
 	}
-	return "[ ]"
+	w := lg.Width(string(r))
+	runeWidthWide.Store(r, w)
+	return w
 }
 
 // isControlRune reports whether r is a terminal control code point that must
@@ -144,6 +121,20 @@ func Sanitize(s string) string {
 		i += size
 	}
 	return b.String()
+}
+
+// SanitizeLines replaces every line of lines with its sanitized form, in place,
+// and returns the slice. Callers use it before handing untrusted multi-line
+// text to a panel body: frame() only sanitizes a line it has to truncate, and
+// lg.Width measures ANSI escape sequences as zero columns, so a short line
+// carrying an OSC/CSI sequence would otherwise reach the terminal verbatim.
+// Newlines are preserved by construction, because each line is sanitized on its
+// own.
+func SanitizeLines(lines []string) []string {
+	for i, line := range lines {
+		lines[i] = Sanitize(line)
+	}
+	return lines
 }
 
 // skipEscapeSequence consumes the ECMA-48 escape sequence starting at s[i]
@@ -225,10 +216,7 @@ func Truncate(s string, w int) string {
 	b.Grow(len(s))
 	cur := 0
 	for _, r := range s {
-		rw := 1
-		if r >= 0x80 {
-			rw = lg.Width(string(r))
-		}
+		rw := runeWidth(r)
 		if cur+rw > w-1 {
 			break
 		}
@@ -237,64 +225,4 @@ func Truncate(s string, w int) string {
 	}
 	b.WriteRune('…')
 	return b.String()
-}
-
-// FormatBytes renders a byte count using binary units with one decimal,
-// e.g. "512.0 B", "12.4 MiB". Negative values render as "-".
-func FormatBytes(b float64) string {
-	if b < 0 {
-		return "-"
-	}
-
-	const unit = 1024
-	if b < unit {
-		return fmt.Sprintf("%.1f B", b)
-	}
-
-	div := float64(unit)
-	exp := 0
-	for n := b / unit; n >= unit && exp < 3; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %ciB", b/div, "KMGT"[exp])
-}
-
-// FormatSpeed renders a transfer rate, e.g. "2.5 MiB/s". Negative values
-// render as "-".
-func FormatSpeed(bps float64) string {
-	if bps < 0 {
-		return "-"
-	}
-	return FormatBytes(bps) + "/s"
-}
-
-// FormatETA renders a remaining-time duration as "1h 02m", "2m 05s" or
-// "45s". Negative values render as "-".
-func FormatETA(secs float64) string {
-	if secs < 0 {
-		return "-"
-	}
-
-	total := int(secs + 0.5)
-	h := total / 3600
-	m := total % 3600 / 60
-	s := total % 60
-	switch {
-	case h > 0:
-		return fmt.Sprintf("%dh %02dm", h, m)
-	case m > 0:
-		return fmt.Sprintf("%dm %02ds", m, s)
-	default:
-		return fmt.Sprintf("%ds", s)
-	}
-}
-
-// FormatPercent renders a percentage right-aligned in three columns, e.g.
-// " 42%" or "100%". Negative values render as " --%".
-func FormatPercent(p float64) string {
-	if p < 0 {
-		return " --%"
-	}
-	return fmt.Sprintf("%3.0f%%", p)
 }

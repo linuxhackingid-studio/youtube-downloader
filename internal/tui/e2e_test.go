@@ -3,6 +3,14 @@
 // real tools, so the whole workflow runs without network access, without a
 // real yt-dlp installation, and without an interactive terminal.
 //
+// The sandbox is assembled for the host operating system: the fakes get the
+// platform's executable suffix, and the fake user directories are exposed
+// through the environment variables os.UserHomeDir and os.UserConfigDir read
+// on that platform (%USERPROFILE% and %AppData% on Windows, $HOME and
+// $HOME/Library/Application Support on macOS, $HOME plus XDG_CONFIG_HOME on
+// Linux and other Unix systems). The journeys themselves are OS-independent,
+// so the suite runs on Windows, Linux and macOS alike.
+//
 // The two subtests share one sandbox and must run in order: the second
 // resumes against the config and archive written by the first.
 
@@ -36,13 +44,42 @@ const (
 	e2eWaitFinish = 30 * time.Second
 )
 
+// exeSuffix returns the executable suffix of the host platform: ".exe" on
+// Windows, empty elsewhere. go build appends it to the -o path, and the tool
+// lookup expects the same name it would find for a real installation.
+func exeSuffix() string {
+	if runtime.GOOS == "windows" {
+		return ".exe"
+	}
+	return ""
+}
+
 // fakeTools is the sandbox built for one TestE2E run: the directory holding
 // the fake executables plus the fake user directories the application is
 // pointed at through the environment.
 type fakeTools struct {
-	binDir  string // PATH entry: yt-dlp.exe and ffmpeg.exe live here
-	homeDir string // USERPROFILE: the default TargetDir sits under it
-	appData string // AppData: config.json is written under it
+	binDir    string // PATH entry: the fake yt-dlp and ffmpeg live here
+	homeDir   string // fake user home: the default TargetDir sits under it
+	appData   string // fake %AppData% (Windows config root)
+	configDir string // user config dir the app resolves on this host
+}
+
+// hostConfigDir mirrors the directory os.UserConfigDir resolves to once
+// installEnv has pointed the process at the sandbox: %AppData% on Windows,
+// $HOME/Library/Application Support on macOS, and XDG_CONFIG_HOME - which
+// installEnv pins to $HOME/.config - on Linux and other Unix systems. It is
+// the single source of truth for the config path the download journey
+// asserts.
+func hostConfigDir(homeDir, appData string) string {
+	const appDir = "lhi-youtube-downloader"
+	switch runtime.GOOS {
+	case "windows":
+		return filepath.Join(appData, appDir)
+	case "darwin":
+		return filepath.Join(homeDir, "Library", "Application Support", appDir)
+	default:
+		return filepath.Join(homeDir, ".config", appDir)
+	}
 }
 
 // buildFakeTools builds the fake yt-dlp (shared with the jobs integration
@@ -65,26 +102,42 @@ func buildFakeTools(t *testing.T) *fakeTools {
 			t.Skipf("cannot build %s (test harness unavailable): %v\n%s", pkg, err, out)
 		}
 	}
-	build("yt-dlp.exe", "./internal/jobs/testdata/fakeytdlp")
-	build("ffmpeg.exe", "./internal/tui/testdata/fakeffmpeg")
+	build("yt-dlp"+exeSuffix(), "./internal/jobs/testdata/fakeytdlp")
+	build("ffmpeg"+exeSuffix(), "./internal/tui/testdata/fakeffmpeg")
 
+	homeDir := filepath.Join(binDir, "home")
+	appData := filepath.Join(binDir, "appdata")
 	return &fakeTools{
-		binDir:  binDir,
-		homeDir: filepath.Join(binDir, "home"),
-		appData: filepath.Join(binDir, "appdata"),
+		binDir:    binDir,
+		homeDir:   homeDir,
+		appData:   appData,
+		configDir: hostConfigDir(homeDir, appData),
 	}
 }
 
 // installEnv points the process environment at the fakes and the temporary
 // user directories. It must be called before New(): config.Load resolves the
-// config path from AppData and config.Default resolves the default target
-// directory from USERPROFILE. The FAKE_* knobs are pinned so an ambient value
-// cannot make the shared fake yt-dlp nondeterministic.
+// config path from os.UserConfigDir and config.Default resolves the default
+// target directory from os.UserHomeDir, so the sandbox pins whichever
+// variables those functions read on this host. The FAKE_* knobs are pinned so
+// an ambient value cannot make the shared fake yt-dlp nondeterministic.
 func (f *fakeTools) installEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("PATH", f.binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("AppData", f.appData)
-	t.Setenv("USERPROFILE", f.homeDir)
+	switch runtime.GOOS {
+	case "windows":
+		t.Setenv("AppData", f.appData)
+		t.Setenv("USERPROFILE", f.homeDir)
+	case "darwin":
+		// os.UserHomeDir reads $HOME; os.UserConfigDir goes straight to
+		// $HOME/Library/Application Support and ignores XDG_CONFIG_HOME.
+		t.Setenv("HOME", f.homeDir)
+	default:
+		// os.UserConfigDir prefers an absolute XDG_CONFIG_HOME over
+		// $HOME/.config, which is exactly where hostConfigDir points.
+		t.Setenv("HOME", f.homeDir)
+		t.Setenv("XDG_CONFIG_HOME", filepath.Join(f.homeDir, ".config"))
+	}
 	t.Setenv("FAKE_SLEEP_MS", "0")
 	t.Setenv("FAKE_STDERR", "0")
 	t.Setenv("FAKE_EXIT", "0")
@@ -230,7 +283,7 @@ func e2eDownloadJourney(t *testing.T, f *fakeTools) {
 
 	// The configuration must have been persisted: the resume journey
 	// relies on it, and it proves saveCmd ran.
-	cfgPath := filepath.Join(f.appData, "lhi-youtube-downloader", "config.json")
+	cfgPath := filepath.Join(f.configDir, "config.json")
 	cfgData, err := os.ReadFile(cfgPath)
 	if err != nil {
 		t.Fatalf("config was not persisted: %v", err)
@@ -291,11 +344,8 @@ func e2eResumeJourney(t *testing.T, f *fakeTools) {
 }
 
 // TestE2E drives the real TUI end to end against fake yt-dlp and ffmpeg
-// binaries.
+// binaries. It runs on Windows, Linux and macOS; only -short skips it.
 func TestE2E(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.Skip("journey pinned to Windows: the fakes are .exe executables and the paths come from AppData/USERPROFILE")
-	}
 	if testing.Short() {
 		t.Skip("e2e test builds binaries and spawns processes")
 	}

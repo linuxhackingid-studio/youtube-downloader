@@ -7,11 +7,13 @@ import (
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
 
+	"linuxhackingid.com/youtube-downloader/internal/platform"
 	"linuxhackingid.com/youtube-downloader/internal/tools"
 )
 
-// checkModel is the setup screen: it probes for yt-dlp and ffmpeg on PATH
-// and reports their versions and install locations.
+// checkModel is the setup screen: it probes for yt-dlp and ffmpeg on PATH,
+// reports their versions and install locations, and names the platform the
+// application runs on.
 type checkModel struct {
 	report   tools.Report
 	checking bool
@@ -35,8 +37,32 @@ func runCheckCmd() tea.Cmd {
 func newCheckModel() checkModel {
 	return checkModel{
 		checking: true,
-		spinner:  spinner.New(spinner.WithSpinner(spinner.Dot), spinner.WithStyle(StyleAccent)),
+		spinner:  newCheckSpinner(),
 	}
+}
+
+// newCheckSpinner builds the probe spinner with the active palette. Spinners
+// copy the style they are built with, so the theme handler rebuilds them
+// through Retheme.
+func newCheckSpinner() spinner.Model {
+	return spinner.New(spinner.WithSpinner(spinner.Dot), spinner.WithStyle(StyleAccent))
+}
+
+// Retheme rebuilds the spinner so it carries the active palette. Spinners
+// copy the style they are built with, so a theme flip has to rebuild them.
+func (m checkModel) Retheme() checkModel {
+	m.spinner = newCheckSpinner()
+	return m
+}
+
+// Tick restarts the spinner animation after a Retheme. The in-flight tick
+// belongs to the retired spinner id and is dropped by the new spinner, so
+// without this the probe would freeze mid-frame.
+func (m checkModel) Tick() tea.Cmd {
+	if !m.checking {
+		return nil
+	}
+	return m.spinner.Tick
 }
 
 // Init starts the first tool check together with the spinner.
@@ -75,38 +101,43 @@ func (m checkModel) Update(msg tea.Msg) (checkModel, tea.Cmd) {
 	return m, nil
 }
 
-// View renders the setup screen. Width is the terminal width used to lay
-// out the install-guide box.
+// View renders the setup screen for the given content width: the probe state
+// or the tool report, the platform line, and, while a tool is missing, the
+// per-OS install guide.
 func (m checkModel) View(width int) string {
 	var b strings.Builder
-
-	b.WriteString(StyleTitle.Render("lhi-youtube-downloader — setup check"))
-	b.WriteString("\n\n")
 
 	if m.checking {
 		b.WriteString("  ")
 		b.WriteString(m.spinner.View())
-		b.WriteString(" Checking yt-dlp & ffmpeg...")
-		b.WriteString("\n")
+		b.WriteString(StyleMuted.Render(" Checking yt-dlp & ffmpeg..."))
+		b.WriteString("\n\n")
 	} else {
-		b.WriteString(toolLine(m.report.YtDlp))
-		b.WriteString("\n")
-		b.WriteString(toolLine(m.report.FFmpeg))
-		b.WriteString("\n")
+		b.WriteString(Panel("Tools",
+			toolLine(m.report.YtDlp, width)+"\n"+toolLine(m.report.FFmpeg, width),
+			width, false))
+		b.WriteString("\n\n")
 	}
+
+	b.WriteString(StyleHeading.Render("Platform"))
+	b.WriteString("  ")
+	b.WriteString(StyleValue.Render(platform.Label()))
+
+	switch {
+	case m.checking:
+		b.WriteString(StyleMuted.Render("   checking..."))
+	case m.Ready():
+		b.WriteString(StyleMuted.Render("   both tools found, press enter to configure the download"))
+	default:
+		b.WriteString(StyleError.Render("   required tools are missing, see the guide below"))
+	}
+	b.WriteString("\n")
 
 	if !m.checking && !m.Ready() {
 		b.WriteString("\n")
 		b.WriteString(RenderBox("Install required tools", tools.InstallGuide(), width))
 		b.WriteString("\n")
 	}
-
-	b.WriteString("\n")
-	b.WriteString(RenderHelp(
-		[2]string{"enter", "continue (enabled when both found)"},
-		[2]string{"r", "re-check"},
-		[2]string{"q", "quit"},
-	))
 
 	return b.String()
 }
@@ -123,9 +154,13 @@ func (m checkModel) ToolPaths() (ytdlpPath, ffmpegPath string) {
 }
 
 // toolLine renders one tool status row: "[OK]  name  version  (path)" or
-// "[MISSING] name — reason". When a tool was found but its version could not
-// be read, the reason is rendered instead of a blank version field.
-func toolLine(st tools.Status) string {
+// "[MISSING] name - reason". When a tool was found but its version could not
+// be read, the reason is rendered instead of a blank version field. The row
+// is trimmed to the content width so the path cannot push the line past the
+// right edge in a narrow terminal.
+func toolLine(st tools.Status, width int) string {
+	name := StyleValue.Render(st.Name)
+
 	if st.Found {
 		// Version and path originate from tool output; strip terminal
 		// control characters before rendering them.
@@ -137,12 +172,17 @@ func toolLine(st tools.Status) string {
 				version = "version unknown"
 			}
 		}
-		return StyleSuccess.Render("[OK]") + "  " + st.Name + "  " + version +
-			"  (" + Sanitize(st.Path) + ")"
+		row := StyleSuccess.Render("[OK]") + "  " + name + "  " +
+			StyleMuted.Render(version) + "  " +
+			StyleMuted.Render("("+Truncate(Sanitize(st.Path), max(width-40, 12))+")")
+		return clipStyled(row, max(width-4, minBoxColumns))
 	}
+
 	reason := Sanitize(st.Err)
 	if reason == "" {
 		reason = "not found"
 	}
-	return StyleError.Render("[MISSING]") + " " + st.Name + " — " + reason
+	row := StyleError.Render("[MISSING]") + " " + name + " " +
+		StyleMuted.Render("-") + " " + StyleError.Render(reason)
+	return clipStyled(row, max(width-4, minBoxColumns))
 }

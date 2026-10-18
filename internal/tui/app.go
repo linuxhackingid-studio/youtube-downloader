@@ -2,7 +2,6 @@ package tui
 
 import (
 	"context"
-	"fmt"
 	"path/filepath"
 	"time"
 
@@ -84,9 +83,15 @@ func New() tea.Model {
 	}
 }
 
-// Init starts the setup check together with its spinner.
+// Init starts the setup check together with its spinner and asks the terminal
+// for its background color.
+//
+// tea.RequestBackgroundColor is a command constructor in bubbletea v2, so it
+// travels through tea.Batch like any other command and makes the terminal
+// answer with a tea.BackgroundColorMsg. Until that reply arrives the dark
+// palette stays active.
 func (m appModel) Init() tea.Cmd {
-	return m.check.Init()
+	return tea.Batch(m.check.Init(), tea.RequestBackgroundColor)
 }
 
 // Update routes every message: window sizes are stored, global and per-screen
@@ -115,6 +120,42 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m.submitForm()
 
+	case tea.BackgroundColorMsg:
+		// The terminal answered the theme probe. A reply that matches the
+		// active palette changes nothing, so the rebuild below runs only on
+		// a real flip: ApplyTheme resets the shared styles, the spinners
+		// carry the old palette as a copied style, and both the pick row
+		// cache and the download screen's memoized frame embed it in
+		// rendered escape sequences.
+		if msg.IsDark() == ThemeIsDark() {
+			return m, nil
+		}
+		ApplyTheme(msg.IsDark())
+		m.check = m.check.Retheme()
+		m.loading = m.loading.Retheme()
+		m.pick = m.pick.Retheme()
+		m.dl.Invalidate()
+
+		// Restart the animation of the visible spinner, if any.
+		switch m.screen {
+		case scrCheck:
+			return m, m.check.Tick()
+		case scrLoading:
+			return m, m.loading.Tick()
+		}
+		return m, nil
+
+	case tea.QuitMsg, tea.InterruptMsg:
+		// Verified against bubbletea v2.1.0 (tea.go): the event loop consumes
+		// QuitMsg and InterruptMsg itself - "case QuitMsg: return model, nil"
+		// (line 789) and "case InterruptMsg: return model, ErrInterrupted"
+		// (line 792) - so Update is never reached with either message and
+		// these cases are defence in depth only. The shutdown that actually
+		// runs is the inline one in every exit path below, because a
+		// tea.Quit returned from this method never comes back to Update.
+		m = m.shutdown()
+		return m, tea.Quit
+
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 	}
@@ -134,14 +175,14 @@ func (m appModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.confirmCancel = true
 			return m, nil
 		}
-		return m, tea.Quit
+		return m.quit()
 	}
 
 	switch m.screen {
 	case scrCheck:
 		switch k {
 		case "q":
-			return m, tea.Quit
+			return m.quit()
 		case "enter":
 			if m.check.Ready() {
 				ytdlpPath, ffmpegPath := m.check.ToolPaths()
@@ -163,7 +204,7 @@ func (m appModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case scrLoading:
 		switch k {
 		case "q":
-			return m, tea.Quit
+			return m.quit()
 		case "esc":
 			// Abandon the fetch and cancel its context; a late
 			// playlistMsg is dropped by the screen+seq guard.
@@ -177,6 +218,12 @@ func (m appModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case scrPick:
+		// While the search field is focused it owns every key, including
+		// enter and esc, so filtering cannot accidentally start downloads
+		// or navigate away.
+		if m.pick.Searching() {
+			return m.forward(msg)
+		}
 		switch k {
 		case "enter":
 			if m.pick.SelectedCount() == 0 {
@@ -212,17 +259,64 @@ func (m appModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case scrDone:
 		switch k {
 		case "q", "enter":
-			return m, tea.Quit
+			return m.quit()
 		case "esc", "r":
 			m.form = newFormModel(m.cfg)
 			m = m.clearFormErr()
 			m.screen = scrForm
 			return m, m.form.Init()
+		case "o":
+			// Opening the output folder is a fire-and-forget launch: it
+			// never blocks the event loop, and a failure is reported on
+			// the summary's status line.
+			m.done = m.done.OpenFolder()
+			return m, nil
 		}
 		return m, nil
 	}
 
 	return m.forward(msg)
+}
+
+// quit shuts every child process down and then ends the program. Every exit
+// path funnels through it; the shutdown runs before tea.Quit is returned
+// because the Bubble Tea event loop swallows QuitMsg without ever calling
+// Update (see the QuitMsg case in Update), so this is the only place where
+// the download children can still be canceled.
+func (m appModel) quit() (tea.Model, tea.Cmd) {
+	m = m.shutdown()
+	return m, tea.Quit
+}
+
+// Shutdown terminates every child process the model started: the jobs manager
+// (which kills the yt-dlp and ffmpeg process trees - taskkill /T /F per handle
+// on Windows, process-group SIGKILL on Unix) and an in-flight playlist fetch.
+// It is safe on a zero model, with no manager and no fetch, and safe to call
+// twice: Manager.Cancel is idempotent and a context cancel func may be called
+// repeatedly.
+//
+// cmd/ytd calls it on the model returned by Program.Run, because bubbletea
+// consumes QuitMsg and InterruptMsg inside its own event loop (see the QuitMsg
+// case in Update): on SIGTERM, a systemd stop or a non-TTY Ctrl+C the app never
+// reaches an exit path in Update, and only this call can take the children
+// down with the process.
+func (m appModel) Shutdown() {
+	if m.mgr != nil {
+		m.mgr.Cancel()
+	}
+	if m.fetchCancel != nil {
+		m.fetchCancel()
+	}
+}
+
+// shutdown is the in-app variant of Shutdown: the same cleanup, returning the
+// model with the fetch context released. Every exit path inside Update funnels
+// through it (via quit), so a quit while the playlist fetch is loading kills
+// that yt-dlp child too.
+func (m appModel) shutdown() appModel {
+	m.Shutdown()
+	m.fetchCancel = nil
+	return m
 }
 
 // handlePlaylistMsg processes the asynchronous fetch result. A result that
@@ -248,6 +342,20 @@ func (m appModel) handlePlaylistMsg(msg playlistMsg) (tea.Model, tea.Cmd) {
 		m.form = m.form.SetError("no videos found (check URL, range and cookies)")
 		m.screen = scrForm
 		return m, nil
+	}
+
+	// Replay the last-known terminal size into the fresh pick model before it
+	// ever renders. Bubble Tea delivers WindowSizeMsg once at startup (and on
+	// SIGWINCH, which the app forwards only to the active screen), but the
+	// pick model is created here, long after those messages: without this
+	// replay its row cache starts cold. View runs on a receiver copy, so the
+	// fallback rebuild it would do on the first frame can never reach the
+	// stored model and every frame would pay the full O(N) rebuild plus the
+	// viewport's line rescan. The replay takes the same warm-up path as a real
+	// resize (rebuildRows at the clamped content width, then syncRows). It is
+	// skipped before the first WindowSizeMsg, when there is no size to replay.
+	if m.width > 0 {
+		m.pick, _ = m.pick.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
 	}
 
 	m.screen = scrPick
@@ -284,15 +392,6 @@ func (m appModel) clearFormErr() appModel {
 	return m
 }
 
-// saveCmd persists the configuration off the event loop. A failed save must
-// not block the workflow; the values stay in memory.
-func saveCmd(cfg config.Config) tea.Cmd {
-	return func() tea.Msg {
-		_ = cfg.Save()
-		return nil
-	}
-}
-
 // startDownloads builds the job manager from the selected videos and moves
 // the app to the download screen.
 func (m appModel) startDownloads() (tea.Model, tea.Cmd) {
@@ -326,15 +425,15 @@ func (m appModel) updateDownload(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.dl, cmd = m.dl.Update(msg)
 	if m.screen == scrDownload && m.dl.Finished() {
-		m.done = newDoneModel(m.cfg, m.mgr)
+		m.done = newDoneModel(m.cfg, m.mgr, m.dl.Elapsed())
 		m.screen = scrDone
 	}
 	return m, cmd
 }
 
 // forward delivers a non-navigation message to the active screen's
-// sub-model. Spinner ticks, tool-check results and download ticks all travel
-// this path; the done screen consumes nothing.
+// sub-model. Spinner ticks, tool-check results, download ticks and mouse
+// wheel events all travel this path; the done screen consumes nothing.
 func (m appModel) forward(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m.screen {
 	case scrCheck:
@@ -362,82 +461,4 @@ func (m appModel) forward(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
-}
-
-// fetchCmd runs the playlist fetch off the event loop. The closure only
-// captures the client, the validated configuration, the request sequence
-// number and the caller-provided context; it never touches model state.
-func fetchCmd(client *ytdlp.Client, cfg config.Config, seq int, ctx context.Context) tea.Cmd {
-	return func() tea.Msg {
-		pl, err := client.FetchPlaylist(ctx, cfg.PlaylistURL, cfg.CookiesBrowser)
-		return playlistMsg{pl: pl, err: err, seq: seq}
-	}
-}
-
-// View renders the header, the active screen, and, while the cancel
-// confirmation is armed on the download screen, the confirmation box.
-func (m appModel) View() tea.View {
-	width, height := m.width, m.height
-	if width <= 0 {
-		width = defaultViewWidth
-	}
-	if height <= 0 {
-		height = defaultViewHeight
-	}
-
-	content := StyleTitle.Render("lhi-youtube-downloader") +
-		StyleMuted.Render(fmt.Sprintf("  %s", screenName(m.screen))) +
-		"\n\n"
-
-	switch m.screen {
-	case scrCheck:
-		content += m.check.View(width)
-	case scrForm:
-		content += m.form.View(width, height-3)
-	case scrLoading:
-		content += m.loading.View(width)
-	case scrPick:
-		content += m.pick.View(width, height-3)
-	case scrDownload:
-		content += m.dl.View(width, height-3)
-	case scrDone:
-		content += m.done.View(width, height-3)
-	}
-
-	if m.confirmCancel && m.screen == scrDownload {
-		content += "\n\n" + RenderBox(
-			"Cancel all downloads?",
-			"y = cancel everything    n = keep downloading",
-			minInt(56, m.width-4),
-		)
-	}
-
-	v := tea.NewView(content)
-	v.AltScreen = true
-	return v
-}
-
-// screenName returns the human-readable name of a screen for the header.
-func screenName(s screen) string {
-	switch s {
-	case scrCheck:
-		return "setup check"
-	case scrForm:
-		return "configuration"
-	case scrLoading:
-		return "loading playlist"
-	case scrPick:
-		return "select videos"
-	case scrDownload:
-		return "downloading"
-	case scrDone:
-		return "finished"
-	default:
-		return ""
-	}
-}
-
-// minInt returns the smaller of a and b.
-func minInt(a, b int) int {
-	return min(a, b)
 }

@@ -46,7 +46,7 @@ func TestSanitizeEscBeforeUppercaseX(t *testing.T) {
 
 	got := Sanitize(in)
 
-	// Pinned implementation behavior (see skipEscapeSequence in widgets.go):
+	// Pinned implementation behavior (see skipEscapeSequence in text.go):
 	// SOS-class introducers run to end of string when no terminator follows,
 	// so both the 'X' and the trailing 'b' are consumed here.
 	if got != "a" {
