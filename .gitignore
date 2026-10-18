@@ -4,7 +4,13 @@
 *.exe
 *.test
 *.out
+coverage.*
+*.log
 
 # OS cruft
-Thumbs.db
 .DS_Store
+Thumbs.db
+
+# Editor and IDE
+.idea/
+.vscode/
