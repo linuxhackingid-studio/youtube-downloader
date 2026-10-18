@@ -39,7 +39,7 @@ func TestMain(m *testing.M) {
 	} else if pkgDir := jobsPackageDir(); pkgDir == "" {
 		fakeBuildErr = errors.New("cannot locate the jobs package directory")
 	} else {
-		out := filepath.Join(tmpDir, "fake-ytdlp.exe")
+		out := filepath.Join(tmpDir, "fake-ytdlp"+exeSuffix())
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		cmd := exec.CommandContext(ctx, "go", "build", "-o", out, "./testdata/fakeytdlp")
 		cmd.Dir = pkgDir
@@ -58,6 +58,15 @@ func TestMain(m *testing.M) {
 		_ = os.RemoveAll(tmpDir)
 	}
 	os.Exit(code)
+}
+
+// exeSuffix returns the platform executable suffix, so the path of the built
+// fake binary stays portable across GOOS values.
+func exeSuffix() string {
+	if runtime.GOOS == "windows" {
+		return ".exe"
+	}
+	return ""
 }
 
 // jobsPackageDir returns the directory containing this test file, which is
@@ -426,4 +435,49 @@ func snapshotIDs(snaps []jobs.JobSnapshot) []string {
 		ids = append(ids, s.Video.ID)
 	}
 	return ids
+}
+
+// TestManager_RevisionMonotonic polls Revision while a two-video run
+// completes: the counter must never decrease and must be positive once Done
+// closes, and a nil receiver must report zero.
+func TestManager_RevisionMonotonic(t *testing.T) {
+	requireFake(t)
+
+	if got := (*jobs.Manager)(nil).Revision(); got != 0 {
+		t.Fatalf("(*jobs.Manager)(nil).Revision() = %d, want 0", got)
+	}
+
+	dir := t.TempDir()
+	mgr := jobs.NewManager(newTestClient(), testOptions(dir, "", 2))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	mgr.Start(ctx)
+
+	timeout := time.After(45 * time.Second)
+	last := mgr.Revision()
+	for {
+		select {
+		case <-mgr.Done():
+			final := mgr.Revision()
+			if final == 0 {
+				t.Fatal("Revision() = 0 after completion, want > 0")
+			}
+			if final < last {
+				t.Fatalf("Revision decreased from %d to %d during the final transition", last, final)
+			}
+			return
+		case <-timeout:
+			t.Fatal("manager did not finish within 45s")
+		default:
+		}
+
+		if rev := mgr.Revision(); rev < last {
+			t.Fatalf("Revision decreased from %d to %d, want non-decreasing", last, rev)
+		} else {
+			last = rev
+		}
+		time.Sleep(time.Millisecond)
+	}
 }

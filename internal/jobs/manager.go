@@ -5,7 +5,6 @@
 package jobs
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"os"
@@ -14,102 +13,6 @@ import (
 
 	"linuxhackingid.com/youtube-downloader/internal/ytdlp"
 )
-
-const (
-	// maxConcurrency is the upper bound applied to Options.Concurrency.
-	maxConcurrency = 10
-	// maxLogLines is the capacity of the global log ring buffer.
-	maxLogLines = 200
-	// maxLogLineLen bounds each stored log line in bytes so a single
-	// oversized progress line cannot inflate the ring buffer's memory
-	// footprint. This is a byte bound only; the render side sanitizes
-	// and truncates for display.
-	maxLogLineLen = 4096
-	// maxErrLen bounds the length of a failure message kept in a snapshot.
-	maxErrLen = 200
-	// archiveSkipMsg is the marker yt-dlp prints when a video is already
-	// listed in the download archive.
-	archiveSkipMsg = "has already been recorded in the archive"
-)
-
-// Status is the lifecycle state of a single download job.
-type Status int
-
-// Job states, in lifecycle order.
-const (
-	StatusQueued Status = iota
-	StatusRunning
-	StatusMerging
-	StatusDone
-	StatusSkipped
-	StatusFailed
-	StatusCanceled
-)
-
-// String returns the lowercase wire name of the status.
-func (s Status) String() string {
-	switch s {
-	case StatusQueued:
-		return "queued"
-	case StatusRunning:
-		return "running"
-	case StatusMerging:
-		return "merging"
-	case StatusDone:
-		return "done"
-	case StatusSkipped:
-		return "skipped"
-	case StatusFailed:
-		return "failed"
-	case StatusCanceled:
-		return "canceled"
-	default:
-		return "unknown"
-	}
-}
-
-// JobSnapshot is an immutable copy of one job's state.
-type JobSnapshot struct {
-	Video      ytdlp.Video
-	Status     Status
-	Percent    float64 // 0..100; -1 unknown; 100 when done
-	SpeedBps   float64 // -1 unknown
-	ETASeconds float64 // -1 unknown
-	Err        string  // short error text when failed
-}
-
-// Summary aggregates the state of every job managed by a Manager.
-type Summary struct {
-	Done     int
-	Skipped  int
-	Failed   int
-	Canceled int
-	Total    int
-}
-
-// Options configures a Manager run.
-type Options struct {
-	PlaylistURL      string
-	TargetDir        string
-	Quality          ytdlp.Quality
-	FilenameTemplate string
-	CookiesBrowser   string
-	ArchivePath      string        // "" disables archive
-	Concurrency      int           // clamped 1..10
-	Videos           []ytdlp.Video // pre-selected list
-}
-
-// job is the mutable state of a single queued download. Every field is
-// guarded by its owning Manager's mutex.
-type job struct {
-	video       ytdlp.Video
-	status      Status
-	percent     float64
-	speed       float64
-	eta         float64
-	errText     string
-	archiveSeen bool // yt-dlp reported the video as already archived
-}
 
 // Manager runs downloads for a pre-selected list of videos with bounded
 // concurrency. All methods are safe for concurrent use; a zero-value Manager
@@ -128,6 +31,7 @@ type Manager struct {
 	jobs    []*job
 	logs    []string
 	handles map[*ytdlp.Handle]struct{}
+	rev     uint64 // observable-change counter, bumped under mu; see Revision
 
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -160,6 +64,9 @@ func NewManager(client *ytdlp.Client, opts Options) *Manager {
 	return m
 }
 
+// maxConcurrency is the upper bound applied to Options.Concurrency.
+const maxConcurrency = 10
+
 // Start begins downloading the queued videos. It does not block; progress is
 // reported through Snapshot, Summary, and Logs, and completion through Done.
 // Only the first call has any effect. Start creates TargetDir with mode 0o755
@@ -185,6 +92,7 @@ func (m *Manager) Start(ctx context.Context) {
 			for _, j := range m.jobs {
 				if j.status == StatusQueued {
 					j.status = StatusCanceled
+					m.rev++
 				}
 			}
 			m.mu.Unlock()
@@ -198,6 +106,7 @@ func (m *Manager) Start(ctx context.Context) {
 				if j.status == StatusQueued {
 					j.status = StatusFailed
 					j.errText = "download client unavailable"
+					m.rev++
 				}
 			}
 			m.mu.Unlock()
@@ -222,6 +131,7 @@ func (m *Manager) Start(ctx context.Context) {
 			if id := strings.TrimSpace(j.video.ID); id != "" && archived[id] {
 				j.status = StatusSkipped
 				j.percent = 100
+				m.rev++
 				continue
 			}
 			pending = append(pending, j)
@@ -253,7 +163,8 @@ func (m *Manager) Start(ctx context.Context) {
 }
 
 // Snapshot returns a deep copy of every job's current state. It is safe to
-// call from any goroutine at any time.
+// call from any goroutine at any time. Revision reports whether the snapshot
+// content may have changed since a previous call.
 func (m *Manager) Snapshot() []JobSnapshot {
 	if m == nil {
 		return nil
@@ -309,12 +220,28 @@ func (m *Manager) Done() <-chan struct{} {
 	return m.done
 }
 
+// Revision returns a counter used for cheap change detection by polling
+// consumers. The contract: it is monotonically non-decreasing, and it changes
+// whenever the content returned by Snapshot, Summary, or Logs may have
+// changed. A consumer that sees the same revision as on its previous tick can
+// skip copying and redrawing. A nil receiver reports 0.
+func (m *Manager) Revision() uint64 {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.rev
+}
+
 // Cancel stops all downloads: it kills every running handle, cancels the
 // internal context derived from the Start context, and marks queued jobs as
-// canceled. Handles are killed while the run context is still live so
-// taskkill /T /F can enumerate yt-dlp's children; canceling the context
-// first would let os/exec reap yt-dlp before its ffmpeg children are found.
-// Cancel is idempotent and safe to call from any goroutine.
+// canceled. Handles are killed while the run context is still live, because
+// killing is how the process tree is walked: taskkill /T /F /PID on Windows
+// and a process-group SIGKILL on Unix both need yt-dlp to still exist in
+// order to find its ffmpeg children. Canceling the context first would let
+// os/exec reap yt-dlp and orphan them. Cancel is idempotent and safe to call
+// from any goroutine.
 func (m *Manager) Cancel() {
 	if m == nil {
 		return
@@ -330,9 +257,10 @@ func (m *Manager) Cancel() {
 		}
 		m.mu.Unlock()
 
-		// Kill outside the lock, context still live: Handle.Kill runs
-		// taskkill /T /F before canceling its own run context, so the
-		// process tree is walked while the parent is still alive.
+		// Kill outside the lock and before canceling the context:
+		// Handle.Kill walks and kills the process tree (taskkill /T /F
+		// /PID on Windows, process-group SIGKILL on Unix) while the
+		// parent process is still alive.
 		for _, h := range handles {
 			if h != nil {
 				h.Kill()
@@ -347,6 +275,7 @@ func (m *Manager) Cancel() {
 		for _, j := range m.jobs {
 			if j.status == StatusQueued {
 				j.status = StatusCanceled
+				m.rev++
 			}
 		}
 		m.mu.Unlock()
@@ -440,8 +369,8 @@ func (m *Manager) runJob(j *job) {
 	// registered after that snapshot would still observe a live context
 	// while the kill loop runs. The m.canceled read is therefore taken in
 	// the same critical section as the registration; relying on ctx.Err()
-	// alone would let os/exec hard-kill yt-dlp without taskkill /T and
-	// orphan its ffmpeg children.
+	// alone would let os/exec hard-kill yt-dlp without walking its
+	// process tree first, orphaning its ffmpeg children.
 	if cancelRequested || m.ctx.Err() != nil {
 		h.Kill()
 	}
@@ -470,27 +399,35 @@ func (m *Manager) beginJob(j *job) bool {
 	defer m.mu.Unlock()
 
 	if m.canceled || m.ctx.Err() != nil || j.status == StatusCanceled {
-		j.status = StatusCanceled
+		// Only an actual state change is observable: a job that is
+		// already canceled must not bump Revision a second time.
+		if j.status != StatusCanceled {
+			j.status = StatusCanceled
+			m.rev++
+		}
 		return false
 	}
 	if j.status != StatusQueued {
 		return false
 	}
 	j.status = StatusRunning
+	m.rev++
 	return true
 }
 
 // markCanceled marks a job as canceled unless it already reached a terminal
-// state.
+// state. Rewriting a job that is already canceled is a no-op: no state change
+// means no Revision bump, so the counter stays a faithful change signal.
 func (m *Manager) markCanceled(j *job) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	switch j.status {
-	case StatusDone, StatusSkipped, StatusFailed:
+	case StatusDone, StatusSkipped, StatusFailed, StatusCanceled:
 		return
 	}
 	j.status = StatusCanceled
+	m.rev++
 }
 
 // handleEvent applies one progress event to a job. Every raw line is also
@@ -500,13 +437,14 @@ func (m *Manager) handleEvent(j *job, ev ytdlp.ProgressEvent) {
 		m.appendLog(line)
 	}
 
-	if strings.Contains(strings.ToLower(ev.Line), archiveSkipMsg) {
+	if archiveSkipLine(ev.Line) {
 		m.mu.Lock()
 		j.archiveSeen = true
 		if j.status != StatusCanceled {
 			j.status = StatusSkipped
 			j.percent = 100
 		}
+		m.rev++
 		m.mu.Unlock()
 		return
 	}
@@ -525,6 +463,7 @@ func (m *Manager) handleEvent(j *job, ev ytdlp.ProgressEvent) {
 			if ev.ETASeconds >= 0 {
 				j.eta = ev.ETASeconds
 			}
+			m.rev++
 		}
 		m.mu.Unlock()
 
@@ -532,6 +471,7 @@ func (m *Manager) handleEvent(j *job, ev ytdlp.ProgressEvent) {
 		m.mu.Lock()
 		if j.status != StatusCanceled {
 			j.status = StatusMerging
+			m.rev++
 		}
 		m.mu.Unlock()
 
@@ -558,21 +498,24 @@ func (m *Manager) finishJob(j *job, exitErr error) {
 			j.status = StatusDone
 		}
 		j.percent = 100
+		m.rev++
 		return
 	}
 
 	// m.canceled is checked alongside m.ctx because Cancel kills handles
-	// before canceling the context: a handle killed by taskkill can
-	// surface an *ExitError before ctx cancellation lands, and that exit
-	// must still resolve to canceled rather than failed.
+	// before canceling the context: a handle killed by a process-tree kill
+	// can surface an *ExitError before ctx cancellation lands, and that
+	// exit must still resolve to canceled rather than failed.
 	if m.canceled || m.ctx.Err() != nil || j.status == StatusCanceled ||
 		errors.Is(exitErr, context.Canceled) || errors.Is(exitErr, context.DeadlineExceeded) {
 		j.status = StatusCanceled
+		m.rev++
 		return
 	}
 
 	j.status = StatusFailed
 	j.errText = shortError(exitErr)
+	m.rev++
 }
 
 // failJob marks a job failed or canceled when it never started a download.
@@ -582,29 +525,12 @@ func (m *Manager) failJob(j *job, err error) {
 
 	if m.canceled || m.ctx.Err() != nil {
 		j.status = StatusCanceled
+		m.rev++
 		return
 	}
 	j.status = StatusFailed
 	j.errText = shortError(err)
-}
-
-// appendLog adds one line to the bounded global log ring. Each stored line
-// is capped at maxLogLineLen bytes.
-func (m *Manager) appendLog(line string) {
-	if len(line) > maxLogLineLen {
-		// Cap by bytes, then drop an incomplete UTF-8 sequence split by
-		// the cut so the ring never retains stray continuation bytes.
-		line = strings.ToValidUTF8(line[:maxLogLineLen], "")
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.logs = append(m.logs, line)
-	if over := len(m.logs) - maxLogLines; over > 0 {
-		n := copy(m.logs, m.logs[over:])
-		m.logs = m.logs[:n]
-	}
+	m.rev++
 }
 
 // closeDone closes the Done channel exactly once.
@@ -612,38 +538,4 @@ func (m *Manager) closeDone() {
 	m.doneOnce.Do(func() {
 		close(m.done)
 	})
-}
-
-// readArchive loads the set of "youtube" video IDs already recorded in a
-// yt-dlp archive file. A missing or unreadable file yields an empty set so
-// downloads proceed; malformed lines are ignored.
-func readArchive(path string) map[string]bool {
-	ids := make(map[string]bool)
-
-	f, err := os.Open(path)
-	if err != nil {
-		return ids
-	}
-	defer f.Close()
-
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		fields := strings.Fields(sc.Text())
-		if len(fields) >= 2 && strings.EqualFold(fields[0], "youtube") {
-			ids[fields[1]] = true
-		}
-	}
-	return ids
-}
-
-// shortError flattens an error into a single bounded line for the TUI.
-func shortError(err error) string {
-	if err == nil {
-		return ""
-	}
-	s := strings.TrimSpace(err.Error())
-	if r := []rune(s); len(r) > maxErrLen {
-		s = string(r[:maxErrLen])
-	}
-	return s
 }
