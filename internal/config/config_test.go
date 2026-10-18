@@ -4,20 +4,50 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
 	"linuxhackingid.com/youtube-downloader/internal/ytdlp"
 )
 
-// redirectConfigDir points os.UserConfigDir (which reads %AppData% on
-// Windows) at a per-test temp directory. It must be called before any
-// Path/Load/Save call. Returns the temp directory for path assertions.
+// redirectConfigDir points the OS-specific environment variables that
+// os.UserConfigDir reads (%AppData% on Windows, $HOME on macOS,
+// $XDG_CONFIG_HOME/$HOME on Linux and the other Unixes) at a per-test temp
+// directory, so Path/Load/Save never touch the developer's real config
+// directory on any OS. It must be called before any Path/Load/Save call.
+// t.Setenv restores the previous values after the test. Returns the temp
+// directory for path assertions.
 func redirectConfigDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	t.Setenv("AppData", dir)
+	switch runtime.GOOS {
+	case "windows":
+		t.Setenv("AppData", dir)
+	case "darwin":
+		t.Setenv("HOME", dir)
+	default:
+		// os.UserConfigDir prefers $XDG_CONFIG_HOME when set to an
+		// absolute path and falls back to $HOME/.config otherwise, so both
+		// are redirected.
+		t.Setenv("XDG_CONFIG_HOME", dir)
+		t.Setenv("HOME", dir)
+	}
 	return dir
+}
+
+// configPathFor returns the config file path that Path() produces when
+// os.UserConfigDir resolves to root on the current OS.
+func configPathFor(root string) string {
+	switch runtime.GOOS {
+	case "windows":
+		return filepath.Join(root, appDirName, configFileName)
+	case "darwin":
+		// os.UserConfigDir appends "/Library/Application Support" to $HOME.
+		return filepath.Join(root, "Library", "Application Support", appDirName, configFileName)
+	default:
+		return filepath.Join(root, appDirName, configFileName)
+	}
 }
 
 // mustPath returns Path() or fails the test.
@@ -49,8 +79,7 @@ func TestPathIsUnderRedirectedConfigDir(t *testing.T) {
 	dir := redirectConfigDir(t)
 
 	got := mustPath(t)
-	want := filepath.Join(dir, "lhi-youtube-downloader", "config.json")
-	if got != want {
+	if want := configPathFor(dir); got != want {
 		t.Errorf("Path() = %q, want %q", got, want)
 	}
 
@@ -61,6 +90,12 @@ func TestPathIsUnderRedirectedConfigDir(t *testing.T) {
 }
 
 func TestValidate(t *testing.T) {
+	// Host-native input for the "target dir is cleaned" case, so it
+	// exercises filepath.Clean on Windows, Linux and macOS alike instead of
+	// relying on a hardcoded Windows path.
+	targetDirInput := filepath.Join(t.TempDir(), "DL") + string(filepath.Separator)
+	targetDirCleaned := filepath.Clean(targetDirInput)
+
 	tests := []struct {
 		name    string
 		mutate  func(*Config)
@@ -183,12 +218,12 @@ func TestValidate(t *testing.T) {
 		},
 		{
 			name:    "target dir is cleaned",
-			mutate:  func(c *Config) { c.TargetDir = `C:\DL\` },
+			mutate:  func(c *Config) { c.TargetDir = targetDirInput },
 			wantErr: false,
 			check: func(t *testing.T, c *Config) {
 				t.Helper()
-				if c.TargetDir != `C:\DL` {
-					t.Errorf("TargetDir = %q, want cleaned value %q", c.TargetDir, `C:\DL`)
+				if c.TargetDir != targetDirCleaned {
+					t.Errorf("TargetDir = %q, want cleaned value %q", c.TargetDir, targetDirCleaned)
 				}
 			},
 		},
@@ -203,8 +238,33 @@ func TestValidate(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			// "C:\evil.%(ext)s" is absolute on Windows, and on every other
+			// OS it is a drive prefix, so it must be rejected everywhere.
 			name:    "absolute drive filename template is rejected",
 			mutate:  func(c *Config) { c.FilenameTemplate = "C:\\evil.%(ext)s" },
+			wantErr: true,
+		},
+		{
+			// Lowercase drive prefix: Windows treats "d:" as a drive
+			// letter, and Unix must not accept it as an ordinary relative
+			// name (a config cannot behave differently per OS).
+			name:    "lowercase drive prefix filename template is rejected",
+			mutate:  func(c *Config) { c.FilenameTemplate = "d:rel/evil.%(ext)s" },
+			wantErr: true,
+		},
+		{
+			// No separator after the colon: still a drive-relative prefix
+			// on Windows and still a ':' name on Unix.
+			name:    "drive prefix without trailing separator is rejected",
+			mutate:  func(c *Config) { c.FilenameTemplate = "C:evil.%(ext)s" },
+			wantErr: true,
+		},
+		{
+			// The colon sits at byte 1, so this is a drive prefix too; only
+			// colons later in the template are left to yt-dlp's per-OS
+			// sanitizing (see TestFilenameTemplateColonLater).
+			name:    "letter-colon prefix filename template is rejected",
+			mutate:  func(c *Config) { c.FilenameTemplate = "a:b/%(ext)s" },
 			wantErr: true,
 		},
 		{
@@ -379,18 +439,30 @@ func TestSaveReplacesExistingFileAtomically(t *testing.T) {
 		t.Errorf("Load() = %+v, want Concurrency 9 and Quality %v after replacement", got, ytdlp.QAudio)
 	}
 
-	if _, err := os.Stat(mustPath(t) + ".tmp"); !os.IsNotExist(err) {
-		t.Errorf("temporary file left behind after Save(): stat error = %v", err)
+	// Save stages the new content under a unique "config-*.tmp" name
+	// beside the target; the rename must leave nothing behind.
+	if leftovers := tempLeftovers(t, mustPath(t)); len(leftovers) != 0 {
+		t.Errorf("temporary files left behind after Save(): %v", leftovers)
 	}
 }
 
-// TestConfigDirUnresolvable pins the graceful behavior when %AppData% is
-// empty: Path and Save report errors, Load silently falls back to defaults.
+// TestConfigDirUnresolvable pins the graceful behavior when the OS config
+// directory cannot be resolved (empty %AppData%, $HOME or $XDG_CONFIG_HOME,
+// depending on the OS): Path and Save report errors, Load silently falls
+// back to defaults.
 func TestConfigDirUnresolvable(t *testing.T) {
-	t.Setenv("AppData", "")
+	switch runtime.GOOS {
+	case "windows":
+		t.Setenv("AppData", "")
+	case "darwin":
+		t.Setenv("HOME", "")
+	default:
+		t.Setenv("XDG_CONFIG_HOME", "")
+		t.Setenv("HOME", "")
+	}
 
 	if _, err := Path(); err == nil {
-		t.Error("Path() error = nil, want error when %AppData% is empty")
+		t.Error("Path() error = nil, want error when the config directory is unresolvable")
 	}
 
 	got, err := Load()
@@ -403,5 +475,71 @@ func TestConfigDirUnresolvable(t *testing.T) {
 
 	if err := Default().Save(); err == nil {
 		t.Error("Save() error = nil, want error when config dir is unresolvable")
+	}
+}
+
+// TestFilenameTemplateColonLater pins that the portable drive-prefix rule
+// only inspects the first two bytes of the template. A colon deeper in the
+// template is not a drive prefix: on Unix and macOS it validates (yt-dlp
+// sanitizes such names for the host filesystem), while on Windows the
+// pre-existing filepath.VolumeName/IsLocal checks keep rejecting every
+// colon, so an error is expected there.
+func TestFilenameTemplateColonLater(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.FilenameTemplate = "sub/a:b.%(ext)s"
+
+	err := cfg.Validate()
+	wantErr := runtime.GOOS == "windows"
+	if (err != nil) != wantErr {
+		t.Errorf("Validate() error = %v, wantErr %v (GOOS = %s)", err, wantErr, runtime.GOOS)
+	}
+}
+
+// TestFilenameTemplateDrivePrefixMessage pins the portable drive-prefix error
+// text on the systems where that check is reachable: on Windows the
+// pre-existing absolute-path check already rejects the same templates, so
+// only the rejection (not the message) is asserted there.
+func TestFilenameTemplateDrivePrefixMessage(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.FilenameTemplate = "d:rel/evil.%(ext)s"
+
+	err := cfg.Validate()
+	if runtime.GOOS == "windows" {
+		if err == nil {
+			t.Fatal("Validate() error = nil, want a drive-prefix template to be rejected on Windows too")
+		}
+		return
+	}
+	const want = "filename template must be relative (no drive prefixes)"
+	if err == nil || err.Error() != want {
+		t.Errorf("Validate() error = %v, want %q", err, want)
+	}
+}
+
+// TestHasWindowsDrivePrefix covers the byte-level boundary of the portable
+// rule: an ASCII letter followed by ':' is a drive prefix, anything else is
+// not (a leading digit or ':' is left to the other template checks and to
+// yt-dlp).
+func TestHasWindowsDrivePrefix(t *testing.T) {
+	tests := []struct {
+		tmpl string
+		want bool
+	}{
+		{`C:\evil.%(ext)s`, true},
+		{"c:/evil.%(ext)s", true},
+		{"d:rel/evil.%(ext)s", true},
+		{"C:evil.%(ext)s", true},
+		{"a:b/%(ext)s", true},
+		{"sub/a:b.%(ext)s", false},
+		{"1:evil.%(ext)s", false},
+		{":evil.%(ext)s", false},
+		{"C", false},
+		{"", false},
+		{"%(ext)s", false},
+	}
+	for _, tt := range tests {
+		if got := hasWindowsDrivePrefix(tt.tmpl); got != tt.want {
+			t.Errorf("hasWindowsDrivePrefix(%q) = %v, want %v", tt.tmpl, got, tt.want)
+		}
 	}
 }

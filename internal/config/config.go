@@ -1,15 +1,18 @@
 // Package config loads and persists the application's user settings in a
 // JSON file under the operating system's user configuration directory.
+//
+// A configuration file is portable: validation rules are OS-independent so
+// that a config authored on Windows, Linux or macOS is accepted or rejected
+// identically by every build (see Validate).
 package config
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
+	"io"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"linuxhackingid.com/youtube-downloader/internal/ytdlp"
 )
@@ -28,6 +31,16 @@ const (
 	// maxFilenameTemplateLen bounds the template so a single field cannot
 	// exceed typical filesystem path limits on its own.
 	maxFilenameTemplateLen = 512
+
+	// maxConfigBytes caps how much of the configuration file is read. The
+	// real file is a few hundred bytes; the cap keeps a hostile or
+	// accidentally huge file from being slurped into memory.
+	maxConfigBytes = 1 << 20 // 1 MiB
+
+	// tempFilePattern names the staged file Save writes before the atomic
+	// rename. The "*" is replaced with a random suffix so the name cannot
+	// be predicted or pre-created by another process.
+	tempFilePattern = "config-*.tmp"
 
 	// default/min/maxConcurrency bound parallel downloads.
 	defaultConcurrency = 3
@@ -75,16 +88,28 @@ func Path() (string, error) {
 	return filepath.Join(dir, appDirName, configFileName), nil
 }
 
+// errConfigTooLarge reports a configuration file that is larger than
+// maxConfigBytes. Load surfaces it to the caller, unlike other read errors,
+// which fall back to the defaults.
+var errConfigTooLarge = errors.New("config file exceeds the size limit")
+
 // Load reads the configuration file. A missing, unreadable, or corrupt file
 // is not an error: the caller receives the defaults. Partial JSON overrides
 // the defaults field-by-field. Load does not validate; the caller decides.
+//
+// At most maxConfigBytes are read; a larger file is refused with an error
+// instead of being read into memory, since no valid configuration comes
+// anywhere near that size.
 func Load() (Config, error) {
 	path, err := Path()
 	if err != nil {
 		return Default(), nil
 	}
-	data, err := os.ReadFile(path)
+	data, err := readConfigFile(path)
 	if err != nil {
+		if errors.Is(err, errConfigTooLarge) {
+			return Default(), err
+		}
 		// Missing or unreadable config: graceful fallback, never an error.
 		return Default(), nil
 	}
@@ -96,9 +121,40 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
-// Save writes the configuration atomically: it encodes to JSON, writes a
-// temporary file next to the target, and renames it into place so readers
-// never observe a partially written file.
+// readConfigFile returns the configuration file contents, reading at most
+// maxConfigBytes. Files over the cap fail with an error naming the limit.
+func readConfigFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+
+	data, err := io.ReadAll(io.LimitReader(f, maxConfigBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxConfigBytes {
+		return nil, fmt.Errorf("%w: %q is larger than %d bytes", errConfigTooLarge, path, maxConfigBytes)
+	}
+	return data, nil
+}
+
+// createTemp is the temporary-file constructor used by Save. It is a
+// package variable so tests can drive the write-stage failure paths, which
+// are otherwise hard to reach portably.
+var createTemp = os.CreateTemp
+
+// Save writes the configuration atomically: it encodes to JSON, stages the
+// content in a uniquely named temporary file beside the target, and renames
+// it into place so readers never observe a partially written file.
+//
+// The staged file is created with os.CreateTemp, which excludes a
+// pre-existing name and makes the path unpredictable, so a symlink planted
+// at a guessable temporary path cannot redirect the write. It carries 0600
+// permissions, which survives the rename and keeps the saved file private
+// on platforms that honor mode bits. On any failure the staged file is
+// removed and Save reports the stage that failed.
 func (c Config) Save() error {
 	path, err := Path()
 	if err != nil {
@@ -111,8 +167,9 @@ func (c Config) Save() error {
 	if err != nil {
 		return fmt.Errorf("encode config: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+
+	tmp, err := stageConfig(filepath.Dir(path), data)
+	if err != nil {
 		return fmt.Errorf("write config: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
@@ -122,113 +179,37 @@ func (c Config) Save() error {
 	return nil
 }
 
-// Validate normalizes the receiver in place and checks it for consistency.
-// It is safe to call on a copy of a loaded configuration.
-func (c *Config) Validate() error {
-	c.TargetDir = filepath.Clean(c.TargetDir)
-	if c.TargetDir == "" || c.TargetDir == "." {
-		// The zero value cleans to ".", meaning the field was never set.
-		return errors.New("target folder is required")
+// stageConfig writes data to a fresh temporary file inside dir and returns
+// its path. The temporary file is flushed to stable storage before it is
+// closed, so the data is durable before Save renames it into place. Any
+// failure removes the partial file and returns the underlying error.
+func stageConfig(dir string, data []byte) (string, error) {
+	f, err := createTemp(dir, tempFilePattern)
+	if err != nil {
+		return "", err
 	}
+	name := f.Name()
 
-	if !strings.Contains(c.FilenameTemplate, extToken) {
-		return fmt.Errorf("filename template must contain %q", extToken)
+	// f.Chmod is a documented no-op for permission bits Windows does not
+	// model, so this only restricts access where the OS enforces modes.
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		_ = os.Remove(name)
+		return "", err
 	}
-	// Reject traversal and absolute templates so yt-dlp cannot write
-	// outside the configured target directory.
-	if hasDotDotSegment(c.FilenameTemplate) {
-		return errors.New("filename template must not contain '..'")
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(name)
+		return "", err
 	}
-	if filepath.IsAbs(c.FilenameTemplate) || filepath.VolumeName(c.FilenameTemplate) != "" {
-		return errors.New("filename template must be relative (no absolute paths)")
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(name)
+		return "", err
 	}
-	if strings.ContainsRune(c.FilenameTemplate, '\x00') {
-		return errors.New("filename template must not contain NUL")
+	if err := f.Close(); err != nil {
+		_ = os.Remove(name)
+		return "", err
 	}
-	if len(c.FilenameTemplate) > maxFilenameTemplateLen {
-		return fmt.Errorf("filename template must be at most %d characters", maxFilenameTemplateLen)
-	}
-	// On Windows, a rooted path without a drive volume ("/evil.%(ext)s" or
-	// "\evil.%(ext)s") is not absolute, yet Python's ntpath.join (used by
-	// yt-dlp) resolves it against the root of the current drive instead of
-	// TargetDir.
-	if hasRootedPrefix(c.FilenameTemplate) {
-		return errors.New("filename template must be relative (no rooted paths)")
-	}
-	// Belt-and-braces: IsLocal additionally rejects templates Windows would
-	// not resolve inside TargetDir (reserved device names and the like).
-	if !filepath.IsLocal(c.FilenameTemplate) {
-		return errors.New("filename template must be relative (no rooted paths)")
-	}
-
-	if c.Concurrency < minConcurrency {
-		c.Concurrency = minConcurrency
-	} else if c.Concurrency > maxConcurrency {
-		c.Concurrency = maxConcurrency
-	}
-
-	if c.RangeStart < 0 {
-		c.RangeStart = 0
-	}
-	if c.RangeEnd < 0 {
-		c.RangeEnd = 0
-	}
-	if c.RangeStart > 0 && c.RangeEnd > 0 && c.RangeStart > c.RangeEnd {
-		return errors.New("range start must be <= range end")
-	}
-
-	if c.Quality < ytdlp.QBest || c.Quality > ytdlp.QAudio {
-		return fmt.Errorf("unsupported quality: %d", c.Quality)
-	}
-
-	switch c.CookiesBrowser {
-	case "", "chrome", "chromium", "edge", "firefox", "brave", "opera", "vivaldi", "whale", "safari":
-	default:
-		return fmt.Errorf("unsupported browser: %s", c.CookiesBrowser)
-	}
-
-	// The playlist URL may be empty at validation time; it is validated
-	// again when a fetch starts. When set, it must be an http(s) URL.
-	if c.PlaylistURL != "" {
-		u, err := url.Parse(c.PlaylistURL)
-		if err != nil || u.Host == "" || !isHTTPScheme(u.Scheme) {
-			return errors.New("invalid playlist URL")
-		}
-	}
-
-	return nil
-}
-
-// hasDotDotSegment reports whether any '/'- or '\\'-separated segment of the
-// filename template is ".." or Windows-normalizes to ".." by dropping trailing
-// dots and spaces (".. ", "...", "....").
-func hasDotDotSegment(tmpl string) bool {
-	for _, seg := range strings.FieldsFunc(tmpl, func(r rune) bool { return r == '/' || r == '\\' }) {
-		if seg == ".." {
-			return true
-		}
-		// Peel trailing dots and spaces, but never below the ".." prefix:
-		// trimming that far would erase the very marker being detected.
-		t := seg
-		for len(t) > 2 && (t[len(t)-1] == '.' || t[len(t)-1] == ' ') {
-			t = t[:len(t)-1]
-		}
-		if t == ".." {
-			return true
-		}
-	}
-	return false
-}
-
-// hasRootedPrefix reports whether the template starts with a path separator.
-// On Windows such a template is rooted but has no drive volume, so it is not
-// absolute, yet Python's ntpath.join (used by yt-dlp) resolves it against the
-// root of the current drive instead of TargetDir.
-func hasRootedPrefix(tmpl string) bool {
-	return tmpl != "" && (tmpl[0] == '/' || tmpl[0] == '\\')
-}
-
-// isHTTPScheme reports whether scheme is "http" or "https", ignoring case.
-func isHTTPScheme(scheme string) bool {
-	return strings.EqualFold(scheme, "http") || strings.EqualFold(scheme, "https")
+	return name, nil
 }
