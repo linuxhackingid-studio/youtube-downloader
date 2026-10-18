@@ -12,9 +12,10 @@ var (
 )
 
 // BenchmarkParseProgressLine measures the steady-state parse of one download
-// progress line, exactly as emitted by downloadProgressTemplate. The expected
-// cost is a single allocation for the strings.Split result; per-field
-// strconv.ParseFloat calls must not allocate.
+// progress line, exactly as emitted by downloadProgressTemplate. The parser
+// must stay allocation-free: it walks the line with strings.IndexByte and
+// parses each field straight from its substring, so no per-field
+// strconv.ParseFloat call may allocate either.
 func BenchmarkParseProgressLine(b *testing.B) {
 	line := "DL|dQw4w9WgXcQ|downloading|10485760|104857600|NA|3145728|42|10.00"
 
